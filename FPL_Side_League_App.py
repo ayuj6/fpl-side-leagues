@@ -125,10 +125,10 @@ def build_gw_data(league_id: int):
 
             event_points = int(h.get("points", 0))
             hit = int(h.get("event_transfers_cost", 0))
-            # FPL history "points" is the GW score after deductions in official total accounting.
-            # We retain gross and net transparently so league rules can be audited.
-            gross = event_points + hit
-            net = event_points
+            # FPL history "points" is the GW score before transfer-hit deductions.
+            # Official season total accounts for the hit separately.
+            gross = event_points
+            net = event_points - hit
 
             records.append({
                 "entry_id": entry,
@@ -142,8 +142,8 @@ def build_gw_data(league_id: int):
                 "captain_effective": cap_eff,
                 "vice_base": vc_base,
                 "vice_effective": vc_eff,
-                "league_total_at_pull": int(m.get("total", 0)),
-                "league_rank_at_pull": int(m.get("rank", 0)),
+                "league_total_at_pull": int(h.get("total_points", 0)),
+                "league_rank_at_pull": int(h.get("overall_rank", 0) or 0),
             })
     return league_meta, pd.DataFrame(records), pd.DataFrame(members), gw_now
 
@@ -378,6 +378,7 @@ with tab5:
             st.success("Saved. Refresh the page.")
 
     st.markdown("### Champions League group draw")
+    st.info("Cloud note: after saving groups or knockout pairings, download the competition config backup and replace competition_config.json in GitHub. This makes the draw persist across Streamlit restarts.")
     st.caption("Use top-32 qualifiers. You can auto-draw once, or edit the JSON below after your live draw.")
     if st.button("Auto-draw Groups A–H from current top 32"):
         ids = q["entry_id"].astype(int).tolist()
