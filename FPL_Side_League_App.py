@@ -77,7 +77,7 @@ DEFAULT_CONFIG = {
     "cl_quarterfinal_gws": [14, 15],
     "cl_semifinal_gws": [16, 17],
     "cl_final_gws": [18],
-    "captain_tiebreak_mode": "base",  # base or effective
+    "captain_tiebreak_mode": "effective",  # final FPL multiplier applied
     "groups": {},
     "knockout_pairings": {}
 }
@@ -120,6 +120,11 @@ def build_gw_data(league_id: int):
 
             cap_base = live_cache[gw].get(cap["element"], 0) if cap else 0
             vc_base = live_cache[gw].get(vc["element"], 0) if vc else 0
+
+            # picks[].multiplier is the manager's FINAL scoring multiplier.
+            # Normal captain = x2, Triple Captain = x3.
+            # If captain does not play, captain multiplier becomes 0 and
+            # the vice-captain inherits x2/x3 when FPL applies the substitution.
             cap_eff = cap_base * int(cap.get("multiplier", 0)) if cap else 0
             vc_eff = vc_base * int(vc.get("multiplier", 0)) if vc else 0
 
@@ -148,9 +153,11 @@ def build_gw_data(league_id: int):
     return league_meta, pd.DataFrame(records), pd.DataFrame(members), gw_now
 
 def tiebreak_columns(config):
-    if config.get("captain_tiebreak_mode") == "effective":
-        return "captain_effective", "vice_effective"
-    return "captain_base", "vice_base"
+    # Use final/post-multiplier FPL scores for this league's tiebreak rules.
+    # This captures x2 captain, x3 Triple Captain, and vice-captain inheritance.
+    if config.get("captain_tiebreak_mode", "effective") == "base":
+        return "captain_base", "vice_base"
+    return "captain_effective", "vice_effective"
 
 def calculate_lms(gw_df, start_gw, cap_col, vc_col):
     alive = set(gw_df["entry_id"].unique())
@@ -366,9 +373,9 @@ with tab5:
         qual = st.number_input("Champions League qualification GW", 1, 38, int(cfg["cl_qualification_gw"]))
         cap_mode = st.selectbox(
             "Captain/vice tiebreak points",
-            ["base", "effective"],
-            index=0 if cfg.get("captain_tiebreak_mode","base") == "base" else 1,
-            help="Base = player's raw GW score. Effective = includes captain multiplier."
+            ["effective", "base"],
+            index=0 if cfg.get("captain_tiebreak_mode","effective") == "effective" else 1,
+            help="Use Effective for this league: it applies the final FPL multiplier, including Triple Captain and vice-captain inheritance when the captain does not play."
         )
         if st.form_submit_button("Save settings"):
             cfg["lms_start_gw"] = int(lms_start)
