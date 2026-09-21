@@ -189,23 +189,32 @@ def calculate_lms(gw_df, start_gw, cap_col, vc_col):
         })
     return alive, pd.DataFrame(eliminations)
 
-def fixture_result(gw_df, a, b, gws, cap_col, vc_col):
+def fixture_result(gw_df, a, b, gws, cap_col="captain_effective", vc_col="vice_effective"):
+    """
+    Champions League knockout tiebreak:
+      1) aggregate net FPL points across the round
+      2) aggregate EFFECTIVE captain points across the round
+      3) aggregate EFFECTIVE vice-captain points across the round
+    If all three are tied, the tie remains unresolved for manual handling.
+    """
     arows = gw_df[(gw_df.entry_id == a) & (gw_df.gw.isin(gws))]
     brows = gw_df[(gw_df.entry_id == b) & (gw_df.gw.isin(gws))]
+
     a_score = int(arows.net_points.sum())
     b_score = int(brows.net_points.sum())
     if a_score != b_score:
-        return a if a_score > b_score else b, a_score, b_score, "points"
-    a_cap, b_cap = int(arows[cap_col].sum()), int(brows[cap_col].sum())
+        return a if a_score > b_score else b, a_score, b_score, "aggregate points"
+
+    a_cap = int(arows["captain_effective"].sum())
+    b_cap = int(brows["captain_effective"].sum())
     if a_cap != b_cap:
-        return a if a_cap > b_cap else b, a_score, b_score, "captain"
-    a_vc, b_vc = int(arows[vc_col].sum()), int(brows[vc_col].sum())
+        return a if a_cap > b_cap else b, a_score, b_score, "effective captain"
+
+    a_vc = int(arows["vice_effective"].sum())
+    b_vc = int(brows["vice_effective"].sum())
     if a_vc != b_vc:
-        return a if a_vc > b_vc else b, a_score, b_score, "vice"
-    a_total = int(arows.league_total_at_pull.max()) if not arows.empty else 0
-    b_total = int(brows.league_total_at_pull.max()) if not brows.empty else 0
-    if a_total != b_total:
-        return a if a_total > b_total else b, a_score, b_score, "league total"
+        return a if a_vc > b_vc else b, a_score, b_score, "effective vice-captain"
+
     return None, a_score, b_score, "unresolved"
 
 def round_robin_four(ids, gws):
@@ -224,11 +233,176 @@ def round_robin_four(ids, gws):
             fixtures.append((gw, x, y))
     return fixtures
 
+
+def build_group_table(group_name, ids, gw_df, group_gws, gw_now, entry_to_team, entry_to_league_rank):
+    """Build one group table + fixture list using completed group-stage GWs only."""
+    rows = {
+        i: {
+            "entry_id": i,
+            "team": entry_to_team.get(i, str(i)),
+            "Group": group_name,
+            "League Rank": int(entry_to_league_rank.get(i, 999999)),
+            "P": 0, "W": 0, "D": 0, "L": 0,
+            "PF": 0, "PA": 0, "Pts": 0
+        }
+        for i in ids
+    }
+    fixture_rows = []
+
+    for gw, a, b in round_robin_four(ids, group_gws):
+        if gw > gw_now:
+            fixture_rows.append({
+                "GW": gw,
+                "Home": entry_to_team.get(a, str(a)),
+                "Away": entry_to_team.get(b, str(b)),
+                "Score": "—",
+                "Result": "Upcoming"
+            })
+            continue
+
+        winner, sa, sb, reason = fixture_result(gw_df, a, b, [gw])
+        rows[a]["P"] += 1
+        rows[b]["P"] += 1
+        rows[a]["PF"] += sa
+        rows[a]["PA"] += sb
+        rows[b]["PF"] += sb
+        rows[b]["PA"] += sa
+
+        # Group-stage matches remain draws on equal net points.
+        # Captain/vice tiebreakers are used for knockout ties.
+        if sa == sb:
+            rows[a]["D"] += 1
+            rows[b]["D"] += 1
+            rows[a]["Pts"] += 1
+            rows[b]["Pts"] += 1
+            result = "Draw"
+        elif sa > sb:
+            rows[a]["W"] += 1
+            rows[b]["L"] += 1
+            rows[a]["Pts"] += 3
+            result = f"{entry_to_team.get(a)} won"
+        else:
+            rows[b]["W"] += 1
+            rows[a]["L"] += 1
+            rows[b]["Pts"] += 3
+            result = f"{entry_to_team.get(b)} won"
+
+        fixture_rows.append({
+            "GW": gw,
+            "Home": entry_to_team.get(a, str(a)),
+            "Away": entry_to_team.get(b, str(b)),
+            "Score": f"{sa}-{sb}",
+            "Result": result
+        })
+
+    table = pd.DataFrame(rows.values())
+    table["GD"] = table["PF"] - table["PA"]
+
+    # Group-stage tiebreak:
+    # 1) group points
+    # 2) total FPL points scored across all group games (PF)
+    # 3) current position in the main mini-league (lower rank number is better)
+    table = table.sort_values(
+        ["Pts", "PF", "League Rank", "entry_id"],
+        ascending=[False, False, True, True]
+    ).reset_index(drop=True)
+    table["Pos"] = table.index + 1
+    return table, pd.DataFrame(fixture_rows)
+
+
+def get_group_qualifiers(groups, gw_df, group_gws, gw_now, entry_to_team, entry_to_league_rank):
+    """
+    Return the top two from every completed group.
+    Qualification is only considered final once ALL configured group GWs are completed.
+    """
+    if not groups or not group_gws or max(group_gws) > gw_now:
+        return pd.DataFrame(), {}
+
+    qualifier_rows = []
+    tables = {}
+    for group_name in sorted(groups):
+        ids = [int(x) for x in groups[group_name]]
+        if len(ids) != 4:
+            continue
+        table, _ = build_group_table(
+            group_name, ids, gw_df, group_gws, gw_now, entry_to_team, entry_to_league_rank
+        )
+        tables[group_name] = table
+        for _, r in table.head(2).iterrows():
+            qualifier_rows.append({
+                "Group": group_name,
+                "Position": int(r["Pos"]),
+                "entry_id": int(r["entry_id"]),
+                "team": r["team"],
+                "Group Pts": int(r["Pts"]),
+                "PF": int(r["PF"]),
+                "GD": int(r["GD"]),
+                "League Rank": int(r["League Rank"]),
+            })
+
+    return pd.DataFrame(qualifier_rows), tables
+
+
+def draw_round_of_16(qualifiers_df):
+    """
+    Draw 8 R16 ties:
+      - group winner vs group runner-up
+      - no rematch against a team from the same group
+    Uses a small backtracking search so the draw is always valid when possible.
+    """
+    if qualifiers_df is None or qualifiers_df.empty or len(qualifiers_df) != 16:
+        return None
+
+    winners = qualifiers_df[qualifiers_df["Position"] == 1][["Group","entry_id"]].to_dict("records")
+    runners = qualifiers_df[qualifiers_df["Position"] == 2][["Group","entry_id"]].to_dict("records")
+    random.shuffle(winners)
+    random.shuffle(runners)
+
+    def backtrack(i, remaining, pairs):
+        if i == len(winners):
+            return pairs
+        w = winners[i]
+        candidates = [r for r in remaining if r["Group"] != w["Group"]]
+        random.shuffle(candidates)
+        for r in candidates:
+            next_remaining = [x for x in remaining if x["entry_id"] != r["entry_id"]]
+            result = backtrack(i + 1, next_remaining, pairs + [[int(w["entry_id"]), int(r["entry_id"])]])
+            if result is not None:
+                return result
+        return None
+
+    return backtrack(0, runners, [])
+
+
+def round_winners(pairs, gws, gw_df, gw_now):
+    """Return completed winners for a knockout round, or None until the round is fully decided."""
+    if not pairs or not gws or max(gws) > gw_now:
+        return None
+
+    winners = []
+    for a, b in pairs:
+        winner, _, _, reason = fixture_result(
+            gw_df, int(a), int(b), gws
+        )
+        if winner is None:
+            return None
+        winners.append(int(winner))
+    return winners
+
+
+def random_open_draw(entry_ids):
+    """Create random open-draw pairings with no restrictions."""
+    ids = [int(x) for x in entry_ids]
+    if len(ids) % 2 != 0 or len(ids) < 2:
+        return None
+    random.shuffle(ids)
+    return [[ids[i], ids[i+1]] for i in range(0, len(ids), 2)]
+
 # -----------------------------
 # UI
 # -----------------------------
 st.title("⚽ FPL Side-League Tracker")
-st.caption(f"Classic League ID: {cfg['league_id']}")
+st.caption(f"Classic League ID: {cfg['league_id']} • CL rules v5")
 
 try:
     league_meta, gw_df, members_df, gw_now = build_gw_data(int(cfg["league_id"]))
@@ -246,6 +420,7 @@ team_lookup = (
     .rename(columns={"entry":"entry_id","entry_name":"team","player_name":"manager"})
 )
 entry_to_team = dict(zip(team_lookup.entry_id.astype(int), team_lookup.team))
+entry_to_league_rank = dict(zip(team_lookup.entry_id.astype(int), team_lookup["rank"].astype(int)))
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     ["🏆 Regular League", "💀 Last Man Standing", "⭐ Champions League", "📊 GW Audit", "⚙️ Admin"]
@@ -276,52 +451,85 @@ with tab2:
 
 with tab3:
     qual_gw = int(cfg["cl_qualification_gw"])
-    # Qualification is reconstructed from cumulative net points through qualification GW.
-    q = gw_df[gw_df.gw <= qual_gw].groupby(["entry_id","team","manager"], as_index=False)["net_points"].sum()
+
+    # Qualification snapshot reconstructed from cumulative net points through qualification GW.
+    q = gw_df[gw_df.gw <= qual_gw].groupby(
+        ["entry_id","team","manager"], as_index=False
+    )["net_points"].sum()
     q = q.sort_values(["net_points","entry_id"], ascending=[False, True]).head(32).reset_index(drop=True)
     q.index = q.index + 1
     q["Seed"] = q.index
+
     st.markdown(f"#### Qualification snapshot — top 32 through GW{qual_gw}")
-    st.dataframe(q[["Seed","team","manager","net_points"]], use_container_width=True, hide_index=True)
+    st.dataframe(
+        q[["Seed","team","manager","net_points"]],
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.caption(
+        "Group tiebreak: group points → total FPL points scored across group games → current main-league position. "
+        "Knockout tiebreak: aggregate net points → effective captain total → effective vice-captain total."
+    )
 
     groups = cfg.get("groups", {})
+    cl_qualifiers = pd.DataFrame()
+    cl_group_tables = {}
+
     if not groups:
         st.info("No group draw saved yet. Use the Admin tab to create or edit Groups A–H.")
     else:
-        standings_all = []
         for group_name in sorted(groups):
             ids = [int(x) for x in groups[group_name]]
             st.markdown(f"### Group {group_name}")
-            fixtures = round_robin_four(ids, cfg["cl_group_gws"])
-            rows = {i: {"entry_id": i, "team": entry_to_team.get(i, str(i)), "P":0,"W":0,"D":0,"L":0,"PF":0,"PA":0,"Pts":0} for i in ids}
-            fixture_rows = []
-            for gw, a, b in fixtures:
-                if gw > gw_now:
-                    fixture_rows.append({"GW":gw,"Home":entry_to_team.get(a,str(a)),"Away":entry_to_team.get(b,str(b)),"Score":"—","Result":"Upcoming"})
-                    continue
-                winner, sa, sb, reason = fixture_result(gw_df, a, b, [gw], cap_col, vc_col)
-                rows[a]["P"] += 1; rows[b]["P"] += 1
-                rows[a]["PF"] += sa; rows[a]["PA"] += sb
-                rows[b]["PF"] += sb; rows[b]["PA"] += sa
-                if sa == sb:
-                    rows[a]["D"] += 1; rows[b]["D"] += 1
-                    rows[a]["Pts"] += 1; rows[b]["Pts"] += 1
-                    result = f"Draw ({reason} tiebreak available)"
-                elif winner == a:
-                    rows[a]["W"] += 1; rows[b]["L"] += 1; rows[a]["Pts"] += 3
-                    result = f"{entry_to_team.get(a)} won"
-                else:
-                    rows[b]["W"] += 1; rows[a]["L"] += 1; rows[b]["Pts"] += 3
-                    result = f"{entry_to_team.get(b)} won"
-                fixture_rows.append({"GW":gw,"Home":entry_to_team.get(a,str(a)),"Away":entry_to_team.get(b,str(b)),"Score":f"{sa}-{sb}","Result":result})
-            table = pd.DataFrame(rows.values())
-            table["GD"] = table["PF"] - table["PA"]
-            table = table.sort_values(["Pts","PF","GD"], ascending=[False,False,False])
-            st.dataframe(table[["team","P","W","D","L","PF","PA","GD","Pts"]], use_container_width=True, hide_index=True)
-            st.dataframe(pd.DataFrame(fixture_rows), use_container_width=True, hide_index=True)
-            standings_all.append(table)
 
-        st.markdown("### Knockout rounds")
+            table, fixture_df = build_group_table(
+                group_name,
+                ids,
+                gw_df,
+                cfg["cl_group_gws"],
+                gw_now,
+                entry_to_team,
+                entry_to_league_rank
+            )
+
+            display_table = table.copy()
+            display_table["Status"] = display_table["Pos"].apply(
+                lambda x: "Qualified" if max(cfg["cl_group_gws"]) <= gw_now and x <= 2 else ""
+            )
+
+            st.dataframe(
+                display_table[["Pos","team","P","W","D","L","PF","PA","Pts","League Rank","Status"]],
+                use_container_width=True,
+                hide_index=True
+            )
+            st.dataframe(fixture_df, use_container_width=True, hide_index=True)
+
+        # Automatically determine final group-stage qualifiers once all group GWs are complete.
+        cl_qualifiers, cl_group_tables = get_group_qualifiers(
+            groups,
+            gw_df,
+            cfg["cl_group_gws"],
+            gw_now,
+            entry_to_team,
+            entry_to_league_rank
+        )
+
+        st.markdown("## Qualified for the Round of 16")
+        if cl_qualifiers.empty:
+            st.caption(
+                f"Final qualifiers will appear automatically after GW{max(cfg['cl_group_gws'])} is complete."
+            )
+        else:
+            qdisplay = cl_qualifiers.copy()
+            qdisplay["Seed Type"] = qdisplay["Position"].map({1:"Group winner", 2:"Runner-up"})
+            st.dataframe(
+                qdisplay[["Group","Seed Type","team","Group Pts","PF","League Rank"]],
+                use_container_width=True,
+                hide_index=True
+            )
+
+        st.markdown("## Knockout rounds")
         knockout = cfg.get("knockout_pairings", {})
         round_gws = {
             "Round of 16": cfg["cl_round_of_16_gws"],
@@ -329,25 +537,52 @@ with tab3:
             "Semifinal": cfg["cl_semifinal_gws"],
             "Final": cfg["cl_final_gws"],
         }
-        for round_name, pairs in knockout.items():
-            st.markdown(f"#### {round_name}")
+
+        for round_name in ["Round of 16", "Quarterfinal", "Semifinal", "Final"]:
+            pairs = knockout.get(round_name, [])
+            if not pairs:
+                continue
+
+            st.markdown(f"### {round_name}")
             rrows = []
             gws = round_gws.get(round_name, [])
+
             for a, b in pairs:
                 a, b = int(a), int(b)
-                if not gws or max(gws) > gw_now:
-                    rrows.append({"Team 1":entry_to_team.get(a,str(a)),"Team 2":entry_to_team.get(b,str(b)),"Aggregate":"—","Winner":"Pending"})
-                else:
-                    winner, sa, sb, reason = fixture_result(gw_df, a, b, gws, cap_col, vc_col)
+
+                # Show live/current aggregate once at least one round GW has started.
+                played_gws = [gw for gw in gws if gw <= gw_now]
+                if not played_gws:
                     rrows.append({
-                        "Team 1":entry_to_team.get(a,str(a)),
-                        "Team 2":entry_to_team.get(b,str(b)),
-                        "Aggregate":f"{sa}-{sb}",
-                        "Winner":entry_to_team.get(winner,"Unresolved") if winner else "Unresolved",
-                        "Decided by":reason
+                        "Team 1": entry_to_team.get(a, str(a)),
+                        "Team 2": entry_to_team.get(b, str(b)),
+                        "Aggregate": "—",
+                        "Winner": "Pending",
+                        "Decided by": ""
                     })
-            if rrows:
-                st.dataframe(pd.DataFrame(rrows), use_container_width=True, hide_index=True)
+                    continue
+
+                winner, sa, sb, reason = fixture_result(
+                    gw_df, a, b, played_gws
+                )
+
+                round_complete = bool(gws) and max(gws) <= gw_now
+                if round_complete:
+                    winner_label = entry_to_team.get(winner, "Unresolved") if winner else "Unresolved"
+                    decided = reason
+                else:
+                    winner_label = "In progress"
+                    decided = ""
+
+                rrows.append({
+                    "Team 1": entry_to_team.get(a, str(a)),
+                    "Team 2": entry_to_team.get(b, str(b)),
+                    "Aggregate": f"{sa}-{sb}",
+                    "Winner": winner_label,
+                    "Decided by": decided
+                })
+
+            st.dataframe(pd.DataFrame(rrows), use_container_width=True, hide_index=True)
 
 with tab4:
     gws = sorted(gw_df.gw.unique(), reverse=True)
@@ -403,16 +638,124 @@ with tab5:
         except Exception as e:
             st.error(f"Invalid JSON: {e}")
 
-    st.markdown("### Knockout pairings")
-    st.caption('Format example: {"Round of 16": [[123,456],[789,1011]], "Quarterfinal": []}')
-    ko_json = st.text_area("Knockout pairings (entry IDs)", value=json.dumps(cfg.get("knockout_pairings",{}), indent=2), height=250)
-    if st.button("Save knockout JSON"):
-        try:
-            cfg["knockout_pairings"] = json.loads(ko_json)
+    st.markdown("### Champions League knockout draw")
+    st.caption(
+        "R16: group winners are drawn against runners-up, with no same-group rematch. "
+        "QF/SF/Final: open draw among the winners of the previous round. "
+        "Knockout tiebreak: aggregate points → effective captain → effective vice-captain."
+    )
+
+    knockout = cfg.setdefault("knockout_pairings", {})
+
+    # Recompute final R16 qualifiers here so Admin works independently of what is visible above.
+    admin_qualifiers, _ = get_group_qualifiers(
+        cfg.get("groups", {}),
+        gw_df,
+        cfg["cl_group_gws"],
+        gw_now,
+        entry_to_team,
+        entry_to_league_rank
+    )
+
+    if admin_qualifiers.empty:
+        st.info(
+            f"Round of 16 draw becomes available automatically after GW{max(cfg['cl_group_gws'])} "
+            "once Groups A–H have been saved and completed."
+        )
+    else:
+        if not knockout.get("Round of 16"):
+            if st.button("🎲 Draw Round of 16"):
+                pairs = draw_round_of_16(admin_qualifiers)
+                if pairs:
+                    knockout["Round of 16"] = pairs
+                    cfg["knockout_pairings"] = knockout
+                    save_config(cfg)
+                    st.success("Round of 16 draw saved. Download the config backup below.")
+                    st.rerun()
+                else:
+                    st.error("Could not produce a valid Round of 16 draw.")
+        else:
+            st.success("Round of 16 draw is saved.")
+
+    # Quarterfinal draw becomes available once R16 is complete.
+    r16_winners = round_winners(
+        knockout.get("Round of 16", []),
+        cfg["cl_round_of_16_gws"],
+        gw_df, gw_now
+    )
+    if r16_winners and not knockout.get("Quarterfinal"):
+        if st.button("🎲 Draw Quarterfinals"):
+            knockout["Quarterfinal"] = random_open_draw(r16_winners)
+            cfg["knockout_pairings"] = knockout
             save_config(cfg)
-            st.success("Knockout pairings saved.")
-        except Exception as e:
-            st.error(f"Invalid JSON: {e}")
+            st.success("Quarterfinal draw saved.")
+            st.rerun()
+
+    qf_winners = round_winners(
+        knockout.get("Quarterfinal", []),
+        cfg["cl_quarterfinal_gws"],
+        gw_df, gw_now
+    )
+    if qf_winners and not knockout.get("Semifinal"):
+        if st.button("🎲 Draw Semifinals"):
+            knockout["Semifinal"] = random_open_draw(qf_winners)
+            cfg["knockout_pairings"] = knockout
+            save_config(cfg)
+            st.success("Semifinal draw saved.")
+            st.rerun()
+
+    sf_winners = round_winners(
+        knockout.get("Semifinal", []),
+        cfg["cl_semifinal_gws"],
+        gw_df, gw_now
+    )
+    if sf_winners and not knockout.get("Final"):
+        if st.button("🏆 Create Final"):
+            knockout["Final"] = random_open_draw(sf_winners)
+            cfg["knockout_pairings"] = knockout
+            save_config(cfg)
+            st.success("Final pairing saved.")
+            st.rerun()
+
+    # Current knockout draw summary.
+    if knockout:
+        st.markdown("#### Saved knockout pairings")
+        for rn in ["Round of 16","Quarterfinal","Semifinal","Final"]:
+            pairs = knockout.get(rn, [])
+            if pairs:
+                st.markdown(f"**{rn}**")
+                summary_rows = []
+                for a, b in pairs:
+                    summary_rows.append({
+                        "Team 1": entry_to_team.get(int(a), str(a)),
+                        "Team 2": entry_to_team.get(int(b), str(b))
+                    })
+                st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+    with st.expander("Advanced: manually edit knockout JSON"):
+        st.caption(
+            'Use this only if you want to override a draw. Example: '
+            '{"Round of 16": [[123,456]], "Quarterfinal": []}'
+        )
+        ko_json = st.text_area(
+            "Knockout pairings (entry IDs)",
+            value=json.dumps(cfg.get("knockout_pairings",{}), indent=2),
+            height=250
+        )
+        if st.button("Save knockout JSON"):
+            try:
+                cfg["knockout_pairings"] = json.loads(ko_json)
+                save_config(cfg)
+                st.success("Knockout pairings saved.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Invalid JSON: {e}")
+
+    if st.button("Clear all knockout draws"):
+        cfg["knockout_pairings"] = {}
+        save_config(cfg)
+        st.success("All knockout draws cleared.")
+        st.rerun()
 
     st.download_button(
         "Download competition config backup",
