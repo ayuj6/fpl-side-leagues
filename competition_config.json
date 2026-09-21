@@ -1,0 +1,28 @@
+{
+  "league_id": 55439,
+  "lms_start_gw": 1,
+  "cl_qualification_gw": 8,
+  "cl_group_gws": [
+    9,
+    10,
+    11
+  ],
+  "cl_round_of_16_gws": [
+    12,
+    13
+  ],
+  "cl_quarterfinal_gws": [
+    14,
+    15
+  ],
+  "cl_semifinal_gws": [
+    16,
+    17
+  ],
+  "cl_final_gws": [
+    18
+  ],
+  "captain_tiebreak_mode": "base",
+  "groups": {},
+  "knockout_pairings": {}
+}
