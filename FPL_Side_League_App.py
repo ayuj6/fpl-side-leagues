@@ -618,33 +618,19 @@ def get_group_qualifiers(groups, gw_df, group_gws, gw_now, entry_to_team, entry_
 
 def draw_round_of_16(qualifiers_df):
     """
-    Draw 8 R16 ties:
-      - group winner vs group runner-up
-      - no rematch against a team from the same group
-    Uses a small backtracking search so the draw is always valid when possible.
+    Draw 8 Round of 16 ties as a fully open random draw.
+
+    Rules:
+      - any qualifier can face any other qualifier
+      - no self-match
+      - every qualifier appears exactly once
+      - no winner/runner-up or same-group restrictions
     """
     if qualifiers_df is None or qualifiers_df.empty or len(qualifiers_df) != 16:
         return None
 
-    winners = qualifiers_df[qualifiers_df["Position"] == 1][["Group","entry_id"]].to_dict("records")
-    runners = qualifiers_df[qualifiers_df["Position"] == 2][["Group","entry_id"]].to_dict("records")
-    random.shuffle(winners)
-    random.shuffle(runners)
-
-    def backtrack(i, remaining, pairs):
-        if i == len(winners):
-            return pairs
-        w = winners[i]
-        candidates = [r for r in remaining if r["Group"] != w["Group"]]
-        random.shuffle(candidates)
-        for r in candidates:
-            next_remaining = [x for x in remaining if x["entry_id"] != r["entry_id"]]
-            result = backtrack(i + 1, next_remaining, pairs + [[int(w["entry_id"]), int(r["entry_id"])]])
-            if result is not None:
-                return result
-        return None
-
-    return backtrack(0, runners, [])
+    ids = qualifiers_df["entry_id"].astype(int).tolist()
+    return random_open_draw(ids)
 
 
 def round_winners(pairs, gws, gw_df, gw_now):
@@ -717,7 +703,7 @@ def manual_pairing_editor(round_key, eligible_ids, entry_to_team):
 # UI
 # -----------------------------
 st.title("⚽ FPL Side-League Tracker")
-st.caption(f"Classic League ID: {cfg['league_id']} • CL manual fixtures v5.3")
+st.caption(f"Classic League ID: {cfg['league_id']} • CL open R16 draw v5.4")
 
 try:
     league_meta, gw_df, members_df, gw_now = build_gw_data(int(cfg["league_id"]))
@@ -1226,7 +1212,7 @@ with tab5:
 
     st.markdown("### Champions League knockout draw")
     st.caption(
-        "For R16, QF and SF you can either conduct your own live/manual draw or use the auto-draw button. "
+        "R16 is a fully open draw: any qualifier can face any other qualifier. QF and SF are also open draws. "
         "Knockout tiebreak remains aggregate points → effective captain → effective vice-captain."
     )
 
@@ -1289,24 +1275,10 @@ with tab5:
             else:
                 r16_pairs = manual_pairing_editor("Round of 16", r16_ids, entry_to_team)
                 if st.button("Save manual Round of 16 draw"):
+                    # R16 is a fully open draw. The standard pairing validator
+                    # only checks that every qualifier is used exactly once,
+                    # nobody plays themselves, and there are no duplicates.
                     ok, msg = validate_manual_pairings(r16_pairs, r16_ids)
-                    if ok:
-                        qmeta = {
-                            int(r["entry_id"]): {
-                                "Group": str(r["Group"]),
-                                "Position": int(r["Position"])
-                            }
-                            for _, r in admin_qualifiers.iterrows()
-                        }
-                        for a, b in r16_pairs:
-                            if qmeta[a]["Group"] == qmeta[b]["Group"]:
-                                ok = False
-                                msg = f"Same-group R16 matchup is not allowed: {entry_to_team.get(a)} vs {entry_to_team.get(b)}."
-                                break
-                            if qmeta[a]["Position"] == qmeta[b]["Position"]:
-                                ok = False
-                                msg = "Each R16 matchup must be a group winner vs a group runner-up."
-                                break
 
                     if ok:
                         knockout["Round of 16"] = r16_pairs
